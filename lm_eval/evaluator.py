@@ -155,6 +155,7 @@ def simple_evaluate(
             "hf",
             "huggingface",
             "vllm",
+            "aphrodite",
         ]:
             eval_logger.warning(
                 "pretrained not specified. Using default pretrained=gpt2."
