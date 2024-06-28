@@ -2,7 +2,7 @@ import copy
 import os
 from datetime import timedelta
 from pathlib import Path
-from typing import List, Literal, Optional, Tuple, Union
+from typing import Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -44,13 +44,13 @@ def _get_accelerate_args(
     max_memory_per_gpu: Optional[Union[int, str]] = None,
     max_cpu_memory: Optional[Union[int, str]] = None,
     offload_folder: Optional[str] = "./offload",
+    gpus: Optional[int] = None,
 ) -> dict:
     """Returns the kwargs needed to apply `accelerate` in `AutoModel.from_pretrained`."""
     max_memory = {}
     if max_memory_per_gpu is not None:
         max_memory_per_gpu_map = {
-            device_idx: max_memory_per_gpu
-            for device_idx in range(torch.cuda.device_count())
+            device_idx: max_memory_per_gpu for device_idx in range(gpus)
         }
         max_memory.update(max_memory_per_gpu_map)
     if max_cpu_memory is not None:
@@ -153,12 +153,16 @@ class HFLM(TemplateLM):
             if accelerator.num_processes > 1:
                 self.accelerator = accelerator
 
+            if "npu" in accelerator.device.type:
+                gpus = torch.npu.device_count()
+
             if not (parallelize or accelerator.num_processes > 1):
                 # use user-passed device
                 device_list = set(
                     ["cuda", "cpu"]
-                    + [f"cuda:{i}" for i in range(torch.cuda.device_count())]
+                    + [f"cuda:{i}" for i in range(gpus)]
                     + ["mps", "mps:0"]
+                    + [f"npu:{i}" for i in range(gpus)]
                 )
                 if device and device in device_list:
                     self._device = torch.device(device)
@@ -216,6 +220,7 @@ class HFLM(TemplateLM):
                 dtype=dtype,
                 trust_remote_code=trust_remote_code,
                 parallelize=parallelize,
+                gpus=gpus,
                 device_map_option=device_map_option,
                 max_memory_per_gpu=max_memory_per_gpu,
                 max_cpu_memory=max_cpu_memory,
@@ -322,6 +327,7 @@ class HFLM(TemplateLM):
                         in [
                             DistributedType.FSDP,
                             DistributedType.MULTI_GPU,
+                            DistributedType.MULTI_NPU,
                         ]
                     ), "Unsupported distributed type provided. Only DDP and FSDP are supported."
                     if accelerator.distributed_type == DistributedType.FSDP:
@@ -330,9 +336,7 @@ class HFLM(TemplateLM):
                         self._model = accelerator.prepare_model(
                             self.model, evaluation_mode=True
                         )
-                    self._device = torch.device(
-                        f"cuda:{accelerator.local_process_index}"
-                    )
+                    self._device = torch.device(f"{accelerator.device}")
                     self.accelerator = accelerator
 
                     if self.accelerator.is_local_main_process:
@@ -415,6 +419,16 @@ class HFLM(TemplateLM):
     def world_size(self):
         return self._world_size
 
+    @property
+    def tokenizer_name(self) -> str:
+        return self.tokenizer.name_or_path.replace("/", "__")
+
+    @property
+    def chat_template(self) -> str:
+        if self.tokenizer.chat_template is not None:
+            return self.tokenizer.chat_template
+        return self.tokenizer.default_chat_template
+
     def _get_backend(
         self,
         config: Union[transformers.PretrainedConfig, transformers.AutoConfig],
@@ -489,6 +503,7 @@ class HFLM(TemplateLM):
         # only used if `parallelize=True`.
         # (accelerate naive PP (device_map) options)
         parallelize: Optional[bool] = False,
+        gpus: Optional[int] = None,
         device_map_option: Optional[str] = "auto",
         max_memory_per_gpu: Optional[Union[int, str]] = None,
         max_cpu_memory: Optional[Union[int, str]] = None,
@@ -520,6 +535,7 @@ class HFLM(TemplateLM):
                     max_memory_per_gpu,
                     max_cpu_memory,
                     offload_folder,
+                    gpus,
                 )
             )
         elif "device_map" not in model_kwargs:
@@ -528,9 +544,7 @@ class HFLM(TemplateLM):
             # for quantized models now seems to be device_map="auto"
             # which breaks data-parallel mode.
             if hasattr(self, "accelerator"):
-                model_kwargs.update(
-                    {"device_map": {"": f"cuda:{self.accelerator.local_process_index}"}}
-                )
+                model_kwargs.update({"device_map": {"": f"{self.accelerator.device}"}})
             else:
                 model_kwargs.update({"device_map": {"": str(self.device)}})
 
@@ -583,7 +597,9 @@ class HFLM(TemplateLM):
             if self._model.config.vocab_size != len(self.tokenizer):
                 # resize model for LoRAs with added tokens
                 self._model.resize_token_embeddings(len(self.tokenizer))
-                eval_logger.info(f"Model config indicates vocab_size='{self._model.config.vocab_size}', but found tokenizer with vocab size '{len(self.tokenizer)}'. Resizing model embedding layer...") 
+                eval_logger.info(
+                    f"Model config indicates vocab_size='{self._model.config.vocab_size}', but found tokenizer with vocab size '{len(self.tokenizer)}'. Resizing model embedding layer..."
+                )
             self._model = PeftModel.from_pretrained(
                 self._model, peft, revision=revision
             )
@@ -1283,6 +1299,14 @@ class HFLM(TemplateLM):
         pbar.close()
 
         return res
+
+    def apply_chat_template(self, chat_history: List[Dict[str, str]]) -> str:
+        """
+        Method to apply a chat template to a list of chat history between user and model.
+        """
+        return self.tokenizer.apply_chat_template(
+            chat_history, tokenize=False, add_generation_prompt=True
+        )
 
     def get_model_info(self) -> dict:
         """
