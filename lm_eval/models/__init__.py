@@ -13,8 +13,9 @@ from . import (
     optimum_lm,
     textsynth,
     vllm_causallms,
-    aphrodite_causallms,
     vllm_vlms,
+    aphrodite_causallms,
+    #aphrodite_vlms,
 )
 
 
