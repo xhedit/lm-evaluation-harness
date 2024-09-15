@@ -1,7 +1,9 @@
 from . import (
     anthropic_llms,
+    api_models,
     dummy,
     gguf,
+    hf_vlms,
     huggingface,
     mamba_lm,
     nemo_lm,
@@ -12,6 +14,7 @@ from . import (
     textsynth,
     vllm_causallms,
     aphrodite_causallms,
+    vllm_vlms,
 )
 
 
